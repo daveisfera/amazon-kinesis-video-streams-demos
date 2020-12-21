@@ -48,6 +48,10 @@ def withRunnerWrapper(envs, fn) {
                 HAS_ERROR = true
                 // Ignore errors so that we can auto recover by retrying
                 unstable err.toString()
+            } catch(EOFException err) {
+                HAS_ERROR = true
+                // Ignore errors so that we can auto recover by retrying
+                unstable err.toString()    
             }
         }
     }

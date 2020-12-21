@@ -9,7 +9,7 @@ RUNNER_JOB_NAME_PREFIX = "producer-runner"
 // TODO: Set up configurability to run different parameter combinations
 // Run long run canary for 12 hours
 LONG_RUN_DURATION_IN_SECONDS = 12 * 60 * 60
-SHORT_RUN_DURATION_IN_SECONDS = 30
+SHORT_RUN_DURATION_IN_SECONDS = 60
 COLD_STARTUP_DELAY_IN_SECONDS = 60 * 60
 MIN_RETRY_DELAY_IN_SECONDS = 60
 FRAGMENT_SIZE_IN_BYTES = 250000
