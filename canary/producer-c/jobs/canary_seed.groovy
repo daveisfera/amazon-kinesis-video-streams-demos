@@ -37,10 +37,10 @@ approveSignatures([
 
 pipelineJob("${NAMESPACE}-orchestrator") {
 	description('Run producer and consumer')
-	logRotator {
-		daysToKeep(DAYS_TO_KEEP_LOGS)
-		numToKeep(NUMBER_OF_LOGS)
-	}
+	// logRotator {
+	// 	daysToKeep(DAYS_TO_KEEP_LOGS)
+	// 	numToKeep(NUMBER_OF_LOGS)
+	// }
     throttleConcurrentBuilds {
         maxPerNode(MAX_EXECUTION_PER_NODE)
     }
@@ -55,10 +55,10 @@ pipelineJob("${NAMESPACE}-orchestrator") {
 
 pipelineJob("${NAMESPACE}-runner-0") {
 	description('Run producer and consumer')
-	logRotator {
-		daysToKeep(DAYS_TO_KEEP_LOGS)
-		numToKeep(NUMBER_OF_LOGS)
-	}
+	// logRotator {
+	// 	daysToKeep(DAYS_TO_KEEP_LOGS)
+	// 	numToKeep(NUMBER_OF_LOGS)
+	// }
 	definition {
         cps {
         	script(readFileFromWorkspace("${GROOVY_SCRIPT_DIR}/runner.groovy"))
@@ -69,10 +69,10 @@ pipelineJob("${NAMESPACE}-runner-0") {
 
 pipelineJob("${NAMESPACE}-runner-1") {
     description('Run producer and consumer')
-    logRotator {
-        daysToKeep(DAYS_TO_KEEP_LOGS)
-        numToKeep(NUMBER_OF_LOGS)
-    }
+    // logRotator {
+    //     daysToKeep(DAYS_TO_KEEP_LOGS)
+    //     numToKeep(NUMBER_OF_LOGS)
+    // }
     definition {
         cps {
             script(readFileFromWorkspace("${GROOVY_SCRIPT_DIR}/runner.groovy"))
