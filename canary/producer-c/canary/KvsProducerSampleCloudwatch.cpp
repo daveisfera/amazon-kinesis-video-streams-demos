@@ -21,6 +21,19 @@ VOID addCanaryMetadataToFrameData(PFrame pFrame)
     putUnalignedInt32BigEndian((PINT32) pCurPtr, COMPUTE_CRC32(pFrame->frameData, pFrame->size));
 }
 
+PVOID putAudioFrameRoutine(PVOID args)
+{
+    STATUS retStatus = STATUS_SUCCESS;
+
+CleanUp:
+
+    if (retStatus != STATUS_SUCCESS) {
+        printf("putAudioFrameRoutine failed with 0x%08x", retStatus);
+    }
+
+    return (PVOID)(ULONG_PTR) retStatus;
+}
+
 VOID createCanaryFrameData(PFrame pFrame)
 {
     UINT32 i;
@@ -29,6 +42,104 @@ VOID createCanaryFrameData(PFrame pFrame)
         pFrame->frameData[i] = RAND();
     }
     addCanaryMetadataToFrameData(pFrame);
+}
+
+typedef struct {
+    UINT64 canaryRunDuration;
+    UINT64 audioFragmentSizeInBytes;
+    UINT64 videoFragmentSizeInBytes;
+    UINT64 runTill;
+    UINT64 randomTime;
+    PCloudwatchLogsObject pCloudwatchLogsObject;
+    BOOL fileLoggingEnabled;
+    STREAM_HANDLE streamHandle;
+    CLIENT_HANDLE clientHandle;
+    PCanaryStreamCallbacks pCanaryStreamCallbacks;
+    UINT64 startTime;
+} CanaryCustomData, *PCanaryCustomData;
+
+PVOID putVideoFrameRoutine(PVOID args)
+{
+    STATUS retStatus = STATUS_SUCCESS;
+    PCanaryCustomData data = (PCanaryCustomData) args;
+    Frame frame;
+    UINT64 lastKeyFrameTimestamp = 0;
+    UINT64 duration;
+    BOOL firstFrame = FALSE;
+    DOUBLE startUpLatency;
+    UINT64 currentTime;
+    UINT64 canaryStopTime;
+    UINT32 frameIndex = 0;
+
+    frame.size = CANARY_METADATA_SIZE + (data->videoFragmentSizeInBytes / DEFAULT_FPS_VALUE); // Every frame must have a metadata
+    frame.frameData = (PBYTE) MEMALLOC(frame.size);
+    CHK(frame.frameData != NULL, STATUS_NOT_ENOUGH_MEMORY);
+    frame.version = FRAME_CURRENT_VERSION;
+    frame.trackId = DEFAULT_VIDEO_TRACK_ID;
+    frame.duration = HUNDREDS_OF_NANOS_IN_A_MILLISECOND / DEFAULT_FPS_VALUE;
+    frame.decodingTs = GETTIME(); // current time
+    frame.presentationTs = frame.decodingTs;
+    currentTime = GETTIME();
+    canaryStopTime = currentTime + (data->canaryRunDuration * HUNDREDS_OF_NANOS_IN_A_SECOND);
+
+    while (GETTIME() < canaryStopTime && ATOMIC_LOAD_BOOL(&sigCaptureInterrupt) != TRUE) {
+        frame.index = frameIndex;
+        frame.flags = frameIndex % DEFAULT_KEY_FRAME_INTERVAL == 0 ? FRAME_FLAG_KEY_FRAME : FRAME_FLAG_NONE;
+
+        createCanaryFrameData(&frame);
+        if (frame.flags == FRAME_FLAG_KEY_FRAME) {
+            if (lastKeyFrameTimestamp != 0) {
+                canaryStreamRecordFragmentEndSendTime(data->pCanaryStreamCallbacks, lastKeyFrameTimestamp, frame.presentationTs);
+                publishMetrics(data->streamHandle, data->clientHandle, data->pCanaryStreamCallbacks);
+                duration = GETTIME() - currentTime;
+                if ((!data->fileLoggingEnabled) && (duration > (60 * HUNDREDS_OF_NANOS_IN_A_SECOND))) {
+                    canaryStreamSendLogs(data->pCloudwatchLogsObject);
+                    currentTime = GETTIME();
+                    retStatus = publishErrorRate(data->streamHandle, data->pCanaryStreamCallbacks, duration);
+                    if(STATUS_FAILED(retStatus)) {
+                        DLOGW("Could not publish error rate. Failed with %08x", retStatus);
+                    }
+                }
+            }
+            lastKeyFrameTimestamp = frame.presentationTs;
+        }
+
+        if (GETTIME() < data->runTill) {
+            CHK_STATUS(putKinesisVideoFrame(data->streamHandle, &frame));
+            THREAD_SLEEP(HUNDREDS_OF_NANOS_IN_A_SECOND / DEFAULT_FPS_VALUE);
+        }
+        else {
+            canaryStreamRecordFragmentEndSendTime(data->pCanaryStreamCallbacks, lastKeyFrameTimestamp, frame.presentationTs);
+            DLOGD("Last frame type put before stopping: %s", (frame.flags == FRAME_FLAG_KEY_FRAME ? "Key Frame" : "Non key frame"));
+            UINT64 sleepTime = ((RAND() % 10) + 1) * HUNDREDS_OF_NANOS_IN_A_MINUTE;
+            DLOGD("Intermittent sleep time is set to: %" PRIu64 " minutes", sleepTime / HUNDREDS_OF_NANOS_IN_A_MINUTE);
+            THREAD_SLEEP(sleepTime);
+            // Reset runTill after 1 run of intermittent scenario
+            data->randomTime = (RAND() % 10) + 1;
+            DLOGD("Intermittent run time is set to: %" PRIu64 " minutes", data->randomTime);
+            data->runTill = GETTIME() + data->randomTime * HUNDREDS_OF_NANOS_IN_A_MINUTE;
+        }
+        // We measure this after first call to ensure that the latency is measured after the first SUCCESSFUL
+        // putKinesisVideoFrame() call
+        if (firstFrame) {
+           startUpLatency = (DOUBLE)(GETTIME() - data->startTime) / (DOUBLE) HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
+           CHK_STATUS(pushStartUpLatency(data->pCanaryStreamCallbacks, startUpLatency));
+           DLOGD("Start up latency: %lf ms", startUpLatency);
+           firstFrame = FALSE;
+        }
+
+        frame.decodingTs = GETTIME(); // current time
+        frame.presentationTs = frame.decodingTs;
+        frameIndex++;
+    }
+
+CleanUp:
+
+    if (retStatus != STATUS_SUCCESS) {
+        DLOGE("putVideoFrameRoutine failed with 0x%08x", retStatus);
+    }
+
+    return (PVOID)(ULONG_PTR) retStatus;
 }
 
 VOID adjustStreamInfoToCanaryType(PStreamInfo pStreamInfo, PCHAR canaryType)
@@ -209,6 +320,11 @@ INT32 main(INT32 argc, CHAR* argv[])
     DOUBLE startUpLatency;
     UINT64 runTill = MAX_UINT64;
     UINT64 randomTime = 0;
+
+    TID audioSendTid, videoSendTid;
+
+    CanaryCustomData data;
+
     initializeEndianness();
     SRAND(time(0));
     Aws::SDKOptions options;
@@ -277,7 +393,7 @@ INT32 main(INT32 argc, CHAR* argv[])
             STRTOUI32(logLevel, NULL, 10, &pDeviceInfo->clientInfo.loggerLogLevel);
         }
 
-        CHK_STATUS(createRealtimeVideoStreamInfoProvider(streamName, DEFAULT_RETENTION_PERIOD, config.bufferDuration, &pStreamInfo));
+        CHK_STATUS(createRealtimeAudioVideoStreamInfoProvider(streamName, DEFAULT_RETENTION_PERIOD, config.bufferDuration, &pStreamInfo));
         adjustStreamInfoToCanaryType(pStreamInfo, config.canaryTypeStr);
         // adjust members of pStreamInfo here if needed
         pStreamInfo->streamCaps.nalAdaptationFlags = NAL_ADAPTATION_FLAG_NONE;
@@ -317,17 +433,17 @@ INT32 main(INT32 argc, CHAR* argv[])
         CHK_STATUS(createKinesisVideoStreamSync(clientHandle, pStreamInfo, &streamHandle));
 
         // setup dummy frame
-        frame.size = CANARY_METADATA_SIZE + config.fragmentSizeInBytes / DEFAULT_FPS_VALUE;
-        frame.frameData = (PBYTE) MEMALLOC(frame.size);
-        CHK(frame.frameData != NULL, STATUS_NOT_ENOUGH_MEMORY);
-        frame.version = FRAME_CURRENT_VERSION;
-        frame.trackId = DEFAULT_VIDEO_TRACK_ID;
-        frame.duration = HUNDREDS_OF_NANOS_IN_A_MILLISECOND / DEFAULT_FPS_VALUE;
-        frame.decodingTs = GETTIME(); // current time
-        frame.presentationTs = frame.decodingTs;
-        currentTime = GETTIME();
-        canaryStopTime = currentTime + (config.canaryDuration * HUNDREDS_OF_NANOS_IN_A_SECOND);
-        UINT64 duration;
+//        frame.size = CANARY_METADATA_SIZE + config.fragmentSizeInBytes / DEFAULT_FPS_VALUE;
+//        frame.frameData = (PBYTE) MEMALLOC(frame.size);
+//        CHK(frame.frameData != NULL, STATUS_NOT_ENOUGH_MEMORY);
+//        frame.version = FRAME_CURRENT_VERSION;
+//        frame.trackId = DEFAULT_VIDEO_TRACK_ID;
+//        frame.duration = HUNDREDS_OF_NANOS_IN_A_MILLISECOND / DEFAULT_FPS_VALUE;
+//        frame.decodingTs = GETTIME(); // current time
+//        frame.presentationTs = frame.decodingTs;
+//        currentTime = GETTIME();
+//        canaryStopTime = currentTime + (config.canaryDuration * HUNDREDS_OF_NANOS_IN_A_SECOND);
+//        UINT64 duration;
 
         DLOGD("Producer SDK Log file name: %s", cloudwatchLogsObject.logStreamName);
 
@@ -340,59 +456,76 @@ INT32 main(INT32 argc, CHAR* argv[])
             pCanaryStreamCallbacks->aggregateMetrics = FALSE;
         }
 
+        // Set up Canary config data
+        data.videoFragmentSizeInBytes = config.fragmentSizeInBytes;
+        data.randomTime = randomTime;
+        data.runTill = runTill;
+        data.pCanaryStreamCallbacks = pCanaryStreamCallbacks;
+        data.canaryRunDuration = config.canaryDuration;
+        data.clientHandle = clientHandle;
+        data.streamHandle = streamHandle;
+        data.fileLoggingEnabled = fileLoggingEnabled;
+        data.startTime = startTime;
+        data.pCloudwatchLogsObject = &cloudwatchLogsObject;
+
+        THREAD_CREATE(&videoSendTid, putVideoFrameRoutine, (PVOID) &data);
+//        THREAD_CREATE(&audioSendTid, putAudioFrameRoutine, (PVOID) &data);
+
+        THREAD_JOIN(videoSendTid, NULL);
+//        THREAD_JOIN(audioSendTid, NULL);
+
         // Say, the canary needs to be stopped before designated canary run time, signal capture
         // must still be supported
-
-        while (GETTIME() < canaryStopTime && ATOMIC_LOAD_BOOL(&sigCaptureInterrupt) != TRUE) {
-            frame.index = frameIndex;
-            frame.flags = frameIndex % DEFAULT_KEY_FRAME_INTERVAL == 0 ? FRAME_FLAG_KEY_FRAME : FRAME_FLAG_NONE;
-
-            createCanaryFrameData(&frame);
-            if (frame.flags == FRAME_FLAG_KEY_FRAME) {
-                if (lastKeyFrameTimestamp != 0) {
-                    canaryStreamRecordFragmentEndSendTime(pCanaryStreamCallbacks, lastKeyFrameTimestamp, frame.presentationTs);
-                    publishMetrics(streamHandle, clientHandle, pCanaryStreamCallbacks);
-                    duration = GETTIME() - currentTime;
-                    if ((!fileLoggingEnabled) && (duration > (60 * HUNDREDS_OF_NANOS_IN_A_SECOND))) {
-                        canaryStreamSendLogs(&cloudwatchLogsObject);
-                        currentTime = GETTIME();
-                        retStatus = publishErrorRate(streamHandle, pCanaryStreamCallbacks, duration);
-                        if(STATUS_FAILED(retStatus)) {
-                            DLOGW("Could not publish error rate. Failed with %08x", retStatus);
-                        }
-                    }
-                }
-                lastKeyFrameTimestamp = frame.presentationTs;
-            }
-
-            if (GETTIME() < runTill) {
-                CHK_STATUS(putKinesisVideoFrame(streamHandle, &frame));
-                THREAD_SLEEP(HUNDREDS_OF_NANOS_IN_A_SECOND / DEFAULT_FPS_VALUE);
-            }
-            else {
-                canaryStreamRecordFragmentEndSendTime(pCanaryStreamCallbacks, lastKeyFrameTimestamp, frame.presentationTs);
-                DLOGD("Last frame type put before stopping: %s", (frame.flags == FRAME_FLAG_KEY_FRAME ? "Key Frame" : "Non key frame"));
-                UINT64 sleepTime = ((RAND() % 10) + 1) * HUNDREDS_OF_NANOS_IN_A_MINUTE;
-                DLOGD("Intermittent sleep time is set to: %" PRIu64 " minutes", sleepTime / HUNDREDS_OF_NANOS_IN_A_MINUTE);
-                THREAD_SLEEP(sleepTime);
-                // Reset runTill after 1 run of intermittent scenario
-                randomTime = (RAND() % 10) + 1;
-                DLOGD("Intermittent run time is set to: %" PRIu64 " minutes", randomTime);
-                runTill = GETTIME() + randomTime * HUNDREDS_OF_NANOS_IN_A_MINUTE;
-            }
-            // We measure this after first call to ensure that the latency is measured after the first SUCCESSFUL
-            // putKinesisVideoFrame() call
-            if (firstFrame) {
-               startUpLatency = (DOUBLE)(GETTIME() - startTime) / (DOUBLE) HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
-               CHK_STATUS(pushStartUpLatency(pCanaryStreamCallbacks, startUpLatency));
-               DLOGD("Start up latency: %lf ms", startUpLatency);
-               firstFrame = FALSE;
-            }
-
-            frame.decodingTs = GETTIME(); // current time
-            frame.presentationTs = frame.decodingTs;
-            frameIndex++;
-        }
+//        while (GETTIME() < canaryStopTime && ATOMIC_LOAD_BOOL(&sigCaptureInterrupt) != TRUE) {
+//            frame.index = frameIndex;
+//            frame.flags = frameIndex % DEFAULT_KEY_FRAME_INTERVAL == 0 ? FRAME_FLAG_KEY_FRAME : FRAME_FLAG_NONE;
+//
+//            createCanaryFrameData(&frame);
+//            if (frame.flags == FRAME_FLAG_KEY_FRAME) {
+//                if (lastKeyFrameTimestamp != 0) {
+//                    canaryStreamRecordFragmentEndSendTime(pCanaryStreamCallbacks, lastKeyFrameTimestamp, frame.presentationTs);
+//                    publishMetrics(streamHandle, clientHandle, pCanaryStreamCallbacks);
+//                    duration = GETTIME() - currentTime;
+//                    if ((!fileLoggingEnabled) && (duration > (60 * HUNDREDS_OF_NANOS_IN_A_SECOND))) {
+//                        canaryStreamSendLogs(&cloudwatchLogsObject);
+//                        currentTime = GETTIME();
+//                        retStatus = publishErrorRate(streamHandle, pCanaryStreamCallbacks, duration);
+//                        if(STATUS_FAILED(retStatus)) {
+//                            DLOGW("Could not publish error rate. Failed with %08x", retStatus);
+//                        }
+//                    }
+//                }
+//                lastKeyFrameTimestamp = frame.presentationTs;
+//            }
+//
+//            if (GETTIME() < runTill) {
+//                CHK_STATUS(putKinesisVideoFrame(streamHandle, &frame));
+//                THREAD_SLEEP(HUNDREDS_OF_NANOS_IN_A_SECOND / DEFAULT_FPS_VALUE);
+//            }
+//            else {
+//                canaryStreamRecordFragmentEndSendTime(pCanaryStreamCallbacks, lastKeyFrameTimestamp, frame.presentationTs);
+//                DLOGD("Last frame type put before stopping: %s", (frame.flags == FRAME_FLAG_KEY_FRAME ? "Key Frame" : "Non key frame"));
+//                UINT64 sleepTime = ((RAND() % 10) + 1) * HUNDREDS_OF_NANOS_IN_A_MINUTE;
+//                DLOGD("Intermittent sleep time is set to: %" PRIu64 " minutes", sleepTime / HUNDREDS_OF_NANOS_IN_A_MINUTE);
+//                THREAD_SLEEP(sleepTime);
+//                // Reset runTill after 1 run of intermittent scenario
+//                randomTime = (RAND() % 10) + 1;
+//                DLOGD("Intermittent run time is set to: %" PRIu64 " minutes", randomTime);
+//                runTill = GETTIME() + randomTime * HUNDREDS_OF_NANOS_IN_A_MINUTE;
+//            }
+//            // We measure this after first call to ensure that the latency is measured after the first SUCCESSFUL
+//            // putKinesisVideoFrame() call
+//            if (firstFrame) {
+//               startUpLatency = (DOUBLE)(GETTIME() - startTime) / (DOUBLE) HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
+//               CHK_STATUS(pushStartUpLatency(pCanaryStreamCallbacks, startUpLatency));
+//               DLOGD("Start up latency: %lf ms", startUpLatency);
+//               firstFrame = FALSE;
+//            }
+//
+//            frame.decodingTs = GETTIME(); // current time
+//            frame.presentationTs = frame.decodingTs;
+//            frameIndex++;
+//        }
         CHK_LOG_ERR(retStatus);
         SAFE_MEMFREE(frame.frameData);
         freeDeviceInfo(&pDeviceInfo);
