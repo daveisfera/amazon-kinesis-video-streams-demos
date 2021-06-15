@@ -74,6 +74,18 @@ def buildPeer(isMaster, params) {
     def role_alias = "w${NODE_NAME}_role_alias"
     def thing_name = "w${NODE_NAME}_thing"
 
+    def endpoint = readFile('canary/producer-c/iot-credential-provider.txt')
+    echo "Endpoint: ${endpoint}"
+    def scripts_dir = "$WORKSPACE/canary/producer-c"
+    def core_cert_file = "${scripts_dir}/p${env.NODE_NAME}_certificate.pem"
+    echo "cert file: ${core_cert_file}"
+    def private_key_file = "${scripts_dir}/p${env.NODE_NAME}_private.key"
+    echo "private key file: ${private_key_file}"
+    def role_alias = "p${env.NODE_NAME}_role_alias"
+    echo "Role alias: ${role_alias}"
+    def thing_name = "p${env.NODE_NAME}_thing"
+    echo "thing name: ${thing_name}"
+
     def envs = [
       'AWS_KVS_LOG_LEVEL': params.AWS_KVS_LOG_LEVEL,
       'CANARY_USE_TURN': params.USE_TURN,
@@ -95,9 +107,7 @@ def buildPeer(isMaster, params) {
 
     withRunnerWrapper(envs) {
         sh """
-            cd ./canary/webrtc-c/scripts &&
-            cd .. &&
-            cd build &&
+            cd ./canary/webrtc-c/build &&
             ${isMaster ? "" : "sleep 10 &&"}
             ./kvsWebrtcCanaryWebrtc"""
     }
